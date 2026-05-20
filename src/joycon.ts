@@ -193,18 +193,40 @@ export class JoyCon {
   }
 
   private async sendOutput(reportId: number, payload: Uint8Array) {
-    // Copy into a fresh ArrayBuffer-backed view to satisfy WebHID's BufferSource typing.
-    const buf = new ArrayBuffer(payload.length);
+    // Pad to the size declared by the device's HID descriptor for this report
+    // (Joy-Con report 0x01 is typically 48 bytes; some platforms reject mismatched sizes).
+    const expected = this.getOutputReportSize(reportId);
+    const size = Math.max(payload.length, expected);
+    const buf = new ArrayBuffer(size);
     new Uint8Array(buf).set(payload);
     await this.device.sendReport(reportId, buf);
   }
 
+  private outputSizeCache = new Map<number, number>();
+  private getOutputReportSize(reportId: number): number {
+    const cached = this.outputSizeCache.get(reportId);
+    if (cached !== undefined) return cached;
+    let bits = 0;
+    for (const c of this.device.collections ?? []) {
+      for (const r of c.outputReports ?? []) {
+        if (r.reportId !== reportId) continue;
+        for (const item of r.items ?? []) {
+          bits += (item.reportSize ?? 0) * (item.reportCount ?? 0);
+        }
+      }
+    }
+    const size = bits > 0 ? Math.ceil(bits / 8) : 0;
+    this.outputSizeCache.set(reportId, size);
+    return size;
+  }
+
   async sendSubcommand(subcmd: number, args: Uint8Array = new Uint8Array()): Promise<DataView | null> {
-    const payload = new Uint8Array(9 + args.length);
+    // Output report 0x01 body: packet#(1) + rumble(8) + subcmdId(1) + args(N) = 10 + N bytes.
+    const payload = new Uint8Array(10 + args.length);
     payload[0] = this.nextPacketNumber();
     payload.set(this.buildRumbleNeutral(), 1);
     payload[9] = subcmd;
-    payload.set(args, 10);
+    if (args.length) payload.set(args, 10);
     // Wait for reply (report 0x21) carrying this subcommand
     const pending = new Promise<DataView>((resolve) => {
       const t = window.setTimeout(() => {
@@ -284,6 +306,7 @@ export class JoyCon {
     args[3] = (address >> 24) & 0xff;
     args[4] = length;
     const reply = await this.sendSubcommand(0x10, args);
+    // Reply layout: address(4) + length(1) + data(N).
     if (!reply || reply.byteLength < 5 + length) return null;
     const out = new Uint8Array(length);
     for (let i = 0; i < length; i++) out[i] = reply.getUint8(5 + i);
@@ -323,28 +346,36 @@ export class JoyCon {
   // ---- Input parsing ----
 
   private handleInputReport = (event: HIDInputReportEvent) => {
-    const data = event.data;
-    const reportId = event.reportId;
-    if (reportId === 0x30 || reportId === 0x21) {
-      this.parseStandard(data);
-      if (reportId === 0x21) this.handleSubcommandReply(data);
-      this.emit();
-    } else if (reportId === 0x3f) {
-      // simple HID mode (not used after init)
+    try {
+      const data = event.data;
+      const reportId = event.reportId;
+      if (reportId === 0x30 || reportId === 0x21) {
+        this.parseStandard(data);
+        if (reportId === 0x21) this.handleSubcommandReply(data);
+        this.emit();
+      } else if (reportId === 0x3f) {
+        // simple HID mode (not used after init)
+      }
+    } catch (err) {
+      console.warn("Joy-Con: input report parse failed", err, event);
     }
   };
 
   private handleSubcommandReply(data: DataView) {
-    // 0x21 layout: same as 0x30 up to byte 12, then 13 = ack, 14 = subcmd id, 15+ = reply
-    if (data.byteLength < 15) return;
-    const subcmd = data.getUint8(14);
+    // 0x21 body layout (no report ID): 0..11 standard, 12 = ACK, 13 = subcmd id, 14+ = reply data.
+    if (data.byteLength < 14) return;
+    const subcmd = data.getUint8(13);
     const resolver = this.subcommandResolvers.get(subcmd);
-    if (resolver) {
-      this.subcommandResolvers.delete(subcmd);
-      // Pass the reply portion starting at byte 14 (subcommand id + reply)
-      const reply = new DataView(data.buffer, data.byteOffset + 14, data.byteLength - 14);
-      resolver(reply);
+    if (!resolver) return;
+    this.subcommandResolvers.delete(subcmd);
+    // Reply DataView starts at the actual reply data (byte 14).
+    const start = data.byteOffset + 14;
+    const len = data.byteLength - 14;
+    if (len <= 0 || start + len > data.buffer.byteLength) {
+      resolver(new DataView(new ArrayBuffer(0)));
+      return;
     }
+    resolver(new DataView(data.buffer, start, len));
   }
 
   private parseStandard(data: DataView) {
