@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { JoyCon, type JoyConSide, type JoyConState } from "./joycon";
 import { SceneController } from "./scene";
+import { imuToEuler } from "./orientation";
 
 interface ConnectedController {
   joycon: JoyCon;
@@ -454,18 +455,8 @@ function Imu({ state }: { state: JoyConState }) {
 
 function Quaternion({ state }: { state: JoyConState }) {
   const q = state.orientation;
-  // Convert to Euler. Joy-Con's primary axis is Y (along the rail), so swap roll/pitch labels:
-  //   pitch = rotation about X, roll = rotation about Y.
-  const ysqr = q.y * q.y;
-  const t0 = 2 * (q.w * q.x + q.y * q.z);
-  const t1 = 1 - 2 * (q.x * q.x + ysqr);
-  const pitch = Math.atan2(t0, t1);
-  let t2 = 2 * (q.w * q.y - q.z * q.x);
-  t2 = Math.max(-1, Math.min(1, t2));
-  const roll = Math.asin(t2);
-  const t3 = 2 * (q.w * q.z + q.x * q.y);
-  const t4 = 1 - 2 * (ysqr + q.z * q.z);
-  const yaw = Math.atan2(t3, t4);
+  // The stored quaternion is in IMU coordinates, not model coordinates.
+  const { roll, pitch, yaw } = imuToEuler(q);
   const deg = (r: number) => (r * 180) / Math.PI;
   return (
     <div className="mono small">

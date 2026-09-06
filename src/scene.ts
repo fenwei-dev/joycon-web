@@ -1,11 +1,12 @@
 import * as THREE from "three";
-import type { ButtonState, JoyConSide, JoyConState, Quaternion, StickState } from "./joycon";
+import type { ButtonState, JoyConSide, JoyConState, StickState } from "./joycon";
+import { imuToModelQuaternion } from "./orientation";
 
 type ButtonName = keyof ButtonState;
 
 interface JoyConMesh {
   group: THREE.Group;
-  outerGroup: THREE.Group; // wrapper that applies axis-remap rotation
+  outerGroup: THREE.Group; // positioning and orientation in model coordinates
   buttons: Partial<Record<ButtonName, THREE.Mesh>>;
   stickPivot?: THREE.Group;
   stickName?: "leftStick" | "rightStick";
@@ -256,13 +257,10 @@ function buildStick(parent: THREE.Group, x: number, y: number, z: number, capCol
 }
 
 function wrapForAxisRemap(inner: Omit<JoyConMesh, 'outerGroup'>): JoyConMesh {
-  // The IMU's body X/Z axes are swapped relative to the model's X/Z.
-  // We rotate the model geometry 90° about Y inside a wrapper group.
-  // The wrapper receives the IMU quaternion (identity at rest = front facing camera).
-  // The inner rotation compensates for the axis swap so pitch/roll map correctly.
+  // Keep geometry in model coordinates. The wrapper receives the converted
+  // quaternion, so identity leaves the front facing the camera.
   const outer = new THREE.Group();
   outer.add(inner.group);
-  inner.group.rotation.y = Math.PI / 2;
   return { ...inner, outerGroup: outer };
 }
 
@@ -635,15 +633,14 @@ export class SceneController {
 
       if (!state) {
         // idle gentle rotation
-        m.group.rotation.y += 0.005;
+        m.outerGroup.rotation.y += 0.005;
         continue;
       }
 
-      // Orientation. The IMU quaternion is applied directly — body-frame
-      // integration in joycon.ts already aligns with the model's local axes.
-      const q = state.orientation;
-      const tq = new THREE.Quaternion(q.x, q.y, q.z, q.w);
-      m.group.quaternion.copy(tq);
+      // Convert the sensor basis rather than rotating the geometry or swapping
+      // Euler angles; this also preserves compound rotations.
+      const q = imuToModelQuaternion(state.orientation);
+      m.outerGroup.quaternion.set(q.x, q.y, q.z, q.w);
 
       // Buttons
       const isHome = (name: string) => name === "home";
