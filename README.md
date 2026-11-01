@@ -22,6 +22,17 @@ Open <http://localhost:3000>. Press a controller's sync button to pair it with
 the OS, then click **Connect Joy-Con** and pick it from the browser chooser.
 Previously granted controllers reconnect automatically.
 
+Click **Arrange** to open the compact controller-order menu. Drag a chip and
+drop it near the left/right edges of another chip to reorder the 3D layout.
+Dropping on a compatible left/right chip's horizontal middle merges them into
+one rigid unit: the target chip highlights and shows **Release to merge**, while
+the dragged chip's placeholder is hidden. The preview draws a translucent
+connector and rotates both halves together. Use **Unlink** to split a pair, or
+**×** to disconnect a controller.
+
+For keyboard sorting, focus a chip's drag area, press **Space**, move with the
+arrow keys, then press **Space** to drop.
+
 ## Scripts
 
 ```bash
@@ -55,3 +66,5 @@ bunx wrangler deploy
 - The right Joy-Con's IMU is mounted mirrored, so its raw Y/Z axes are inverted
   before fusion. The displayed IMU values and 3D orientation therefore use the
   same canonical axes as the left Joy-Con and Pro Controller.
+- Linked Joy-Cons use the left half's orientation for the shared rigid body; if
+  that half has no reading, the right half is used instead.

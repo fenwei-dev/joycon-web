@@ -1,10 +1,37 @@
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
+import {
+  DndContext,
+  DragOverlay,
+  KeyboardSensor,
+  PointerSensor,
+  closestCenter,
+  pointerWithin,
+  useDroppable,
+  useSensor,
+  useSensors,
+  type CollisionDetection,
+  type DragEndEvent,
+  type DragOverEvent,
+  type DraggableAttributes,
+  type DraggableSyntheticListeners,
+} from "@dnd-kit/core";
+import { restrictToHorizontalAxis } from "@dnd-kit/modifiers";
+import {
+  SortableContext,
+  arrayMove,
+  horizontalListSortingStrategy,
+  sortableKeyboardCoordinates,
+  useSortable,
+} from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
 import { JoyCon, type JoyConSide, type JoyConState } from "./joycon";
-import { SceneController } from "./scene";
+import { SceneController, type SceneUnit } from "./scene";
 import { imuToEuler } from "./orientation";
 
 interface ConnectedController {
   id: number;
+  partnerId: number | null;
   joycon: JoyCon;
   state: JoyConState;
   playerLights: number;
@@ -12,7 +39,61 @@ interface ConnectedController {
   unsubscribe: () => void;
 }
 
+interface ControllerUnit {
+  id: number;
+  kind: "single" | "pair";
+  controllers: ConnectedController[];
+}
+
 const BATTERY_LABEL = ["Empty", "Critical", "Low", "Medium", "Full"];
+const SIDE_RANK: Record<JoyConSide, number> = { left: 0, right: 1, pro: 0 };
+
+function buildUnits(controllers: ConnectedController[], order: number[]): ControllerUnit[] {
+  const byId = new Map(controllers.map((controller) => [controller.id, controller]));
+  const seen = new Set<number>();
+  const units: ControllerUnit[] = [];
+
+  const addUnit = (id: number, primary: ConnectedController) => {
+    if (seen.has(primary.id)) return;
+    const members = [primary];
+    seen.add(primary.id);
+    if (primary.partnerId !== null) {
+      const partner = byId.get(primary.partnerId);
+      if (partner && !seen.has(partner.id)) {
+        members.push(partner);
+        seen.add(partner.id);
+      }
+    }
+    members.sort((a, b) => SIDE_RANK[a.joycon.side] - SIDE_RANK[b.joycon.side]);
+    units.push({ id, kind: members.length === 2 ? "pair" : "single", controllers: members });
+  };
+
+  for (const id of order) {
+    const primary = byId.get(id);
+    if (primary) addUnit(id, primary);
+  }
+
+  // Defensive: include controllers that arrived before the order was updated.
+  for (const controller of controllers) {
+    if (!seen.has(controller.id)) addUnit(controller.id, controller);
+  }
+  return units;
+}
+
+function isLinkablePair(a: JoyConSide, b: JoyConSide) {
+  return (a === "left" && b === "right") || (a === "right" && b === "left");
+}
+
+function unitLabel(unit: ControllerUnit) {
+  if (unit.kind === "pair") return "Linked";
+  return sideShort(unit.controllers[0]!.joycon.side);
+}
+
+function sideShort(side: JoyConSide) {
+  if (side === "left") return "L";
+  if (side === "right") return "R";
+  return "Pro";
+}
 
 function snapshotState(state: JoyConState): JoyConState {
   return {
@@ -28,6 +109,8 @@ function snapshotState(state: JoyConState): JoyConState {
 
 export default function App() {
   const [controllers, setControllers] = useState<ConnectedController[]>([]);
+  const [unitOrder, setUnitOrder] = useState<number[]>([]);
+  const [layoutOpen, setLayoutOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [webhidSupported, setWebhidSupported] = useState(true);
   const sceneRef = useRef<SceneController | null>(null);
@@ -35,6 +118,12 @@ export default function App() {
   const controllersRef = useRef<ConnectedController[]>([]);
   const attachedDevicesRef = useRef(new Set<HIDDevice>());
   const nextControllerIdRef = useRef(1);
+  const layoutMenuRef = useRef<HTMLDivElement | null>(null);
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
+  );
+  const units = useMemo(() => buildUnits(controllers, unitOrder), [controllers, unitOrder]);
 
   // Mount scene
   useEffect(() => {
@@ -55,26 +144,41 @@ export default function App() {
 
   // Rebuild the 3D scene only when the controller layout changes. Doing this
   // on every state update would recreate the models at report rate.
-  const controllerSides = controllers.map((c) => c.joycon.side).join(",");
-  useEffect(() => {
-    const scene = sceneRef.current;
-    if (!scene) return;
-    scene.setControllers(controllers.map((c) => c.joycon.side));
-    controllers.forEach((c, i) => {
-      scene.updateState(i, c.state);
-      scene.setPlayerLights(i, c.playerLights);
-      scene.setHomeLight(i, c.homeIntensity);
-    });
-  }, [controllerSides]);
+  const sceneUnits = units.map((unit): SceneUnit => {
+    if (unit.kind === "pair") {
+      const left = unit.controllers.find((c) => c.joycon.side === "left")!;
+      const right = unit.controllers.find((c) => c.joycon.side === "right")!;
+      return { kind: "pair", id: unit.id, leftId: left.id, rightId: right.id };
+    }
+    return { kind: "single", id: unit.id, side: unit.controllers[0]!.joycon.side };
+  });
+  const unitSignature = sceneUnits
+    .map((unit) =>
+      unit.kind === "pair"
+        ? `pair:${unit.id}:${unit.leftId}:${unit.rightId}`
+        : `single:${unit.id}:${unit.side}`,
+    )
+    .join("|");
 
   useEffect(() => {
     const scene = sceneRef.current;
     if (!scene) return;
-    controllers.forEach((c, i) => {
-      scene.updateState(i, c.state);
-      scene.setPlayerLights(i, c.playerLights);
-      scene.setHomeLight(i, c.homeIntensity);
-    });
+    scene.setUnits(sceneUnits);
+    for (const c of controllers) {
+      scene.updateState(c.id, c.state);
+      scene.setPlayerLights(c.id, c.playerLights);
+      scene.setHomeLight(c.id, c.homeIntensity);
+    }
+  }, [unitSignature]);
+
+  useEffect(() => {
+    const scene = sceneRef.current;
+    if (!scene) return;
+    for (const c of controllers) {
+      scene.updateState(c.id, c.state);
+      scene.setPlayerLights(c.id, c.playerLights);
+      scene.setHomeLight(c.id, c.homeIntensity);
+    }
   }, [controllers]);
 
   const updateControllers = useCallback(
@@ -86,6 +190,68 @@ export default function App() {
       });
     },
     [],
+  );
+
+  const updateUnitOrder = useCallback((update: (prev: number[]) => number[]) => {
+    setUnitOrder((prev) => update(prev));
+  }, []);
+
+  const reorderUnits = useCallback(
+    (activeId: number, overId: number) => {
+      updateUnitOrder((prev) => {
+        const oldIndex = prev.indexOf(activeId);
+        const newIndex = prev.indexOf(overId);
+        if (oldIndex < 0 || newIndex < 0) return prev;
+        return arrayMove(prev, oldIndex, newIndex);
+      });
+    },
+    [updateUnitOrder],
+  );
+
+  const linkControllers = useCallback(
+    (activeId: number, targetId: number) => {
+      const active = controllersRef.current.find((c) => c.id === activeId);
+      const target = controllersRef.current.find((c) => c.id === targetId);
+      if (!active || !target) return;
+      if (active.partnerId !== null || target.partnerId !== null) return;
+      if (!isLinkablePair(active.joycon.side, target.joycon.side)) return;
+
+      updateControllers((prev) =>
+        prev.map((c) => {
+          if (c.id === activeId) return { ...c, partnerId: targetId };
+          if (c.id === targetId) return { ...c, partnerId: activeId };
+          return c;
+        }),
+      );
+      updateUnitOrder((prev) => {
+        const activeIndex = prev.indexOf(activeId);
+        const targetIndex = prev.indexOf(targetId);
+        if (activeIndex < 0 || targetIndex < 0) return prev;
+        const insertAt = targetIndex - (activeIndex < targetIndex ? 1 : 0);
+        const next = prev.filter((id) => id !== activeId && id !== targetId);
+        next.splice(Math.max(0, Math.min(insertAt, next.length)), 0, targetId);
+        return next;
+      });
+    },
+    [updateControllers, updateUnitOrder],
+  );
+
+  const unlinkUnit = useCallback(
+    (unit: ControllerUnit) => {
+      if (unit.kind !== "pair") return;
+      const ids = unit.controllers.map((c) => c.id);
+      updateControllers((prev) =>
+        prev.map((c) => (ids.includes(c.id) ? { ...c, partnerId: null } : c)),
+      );
+      updateUnitOrder((prev) => {
+        const index = prev.indexOf(unit.id);
+        if (index < 0) return prev;
+        const next = [...prev];
+        next.splice(index, 1, ...ids);
+        return next;
+      });
+    },
+    [updateControllers, updateUnitOrder],
   );
 
   const attachController = useCallback(async (jc: JoyCon, options: { silent?: boolean } = {}) => {
@@ -104,6 +270,7 @@ export default function App() {
         ...prev,
         {
           id,
+          partnerId: null,
           joycon: jc,
           state: snapshotState(jc.state),
           playerLights: 0b0001,
@@ -111,21 +278,39 @@ export default function App() {
           unsubscribe,
         },
       ]);
+      updateUnitOrder((prev) => [...prev, id]);
     } catch (e) {
       attachedDevicesRef.current.delete(jc.device);
       await jc.close().catch(() => {});
       if (!options.silent) setError(e instanceof Error ? e.message : String(e));
     }
-  }, [updateControllers]);
+  }, [updateControllers, updateUnitOrder]);
 
   const detachController = useCallback(async (controller: ConnectedController) => {
     controller.unsubscribe();
     attachedDevicesRef.current.delete(controller.joycon.device);
-    updateControllers((prev) => prev.filter((c) => c.id !== controller.id));
+
+    const partnerId = controller.partnerId;
+    const partnerExists =
+      partnerId !== null && controllersRef.current.some((c) => c.id === partnerId);
+    updateControllers((prev) =>
+      prev
+        .filter((c) => c.id !== controller.id)
+        .map((c) => (c.id === partnerId ? { ...c, partnerId: null } : c)),
+    );
+    updateUnitOrder((prev) => {
+      const index = prev.indexOf(controller.id);
+      if (index < 0) return prev;
+      const next = [...prev];
+      if (partnerExists) next.splice(index, 1, partnerId!);
+      else next.splice(index, 1);
+      return next;
+    });
+
     try {
       await controller.joycon.close();
     } catch {}
-  }, [updateControllers]);
+  }, [updateControllers, updateUnitOrder]);
 
   const handleConnect = useCallback(async () => {
     setError(null);
@@ -155,12 +340,8 @@ export default function App() {
     };
     const onDisconnect = (e: HIDConnectionEvent) => {
       const target = controllersRef.current.find((c) => c.joycon.device === e.device);
-      if (target) {
-        target.unsubscribe();
-        void target.joycon.close();
-      }
-      attachedDevicesRef.current.delete(e.device);
-      updateControllers((prev) => prev.filter((c) => c.joycon.device !== e.device));
+      if (target) void detachController(target);
+      else attachedDevicesRef.current.delete(e.device);
     };
     navigator.hid?.addEventListener("connect", onConnect);
     navigator.hid?.addEventListener("disconnect", onDisconnect);
@@ -169,7 +350,7 @@ export default function App() {
       navigator.hid?.removeEventListener("connect", onConnect);
       navigator.hid?.removeEventListener("disconnect", onDisconnect);
     };
-  }, [attachController, updateControllers]);
+  }, [attachController, detachController]);
 
   // Close any open devices when the app unmounts.
   useEffect(() => {
@@ -183,6 +364,29 @@ export default function App() {
     };
   }, []);
 
+  // The arrangement popover only makes sense while something is connected.
+  useEffect(() => {
+    if (!controllers.length) setLayoutOpen(false);
+  }, [controllers.length]);
+
+  useEffect(() => {
+    if (!layoutOpen) return;
+    const onPointerDown = (event: PointerEvent) => {
+      if (layoutMenuRef.current && !layoutMenuRef.current.contains(event.target as Node)) {
+        setLayoutOpen(false);
+      }
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setLayoutOpen(false);
+    };
+    document.addEventListener("pointerdown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [layoutOpen]);
+
   return (
     <div className="app">
       <header className="topbar">
@@ -194,6 +398,27 @@ export default function App() {
           </div>
         </div>
         <div className="actions">
+          {controllers.length > 0 && (
+            <div className="layout-menu-wrap" ref={layoutMenuRef}>
+              <button
+                className="ghost arrange-button"
+                onClick={() => setLayoutOpen((open) => !open)}
+                aria-expanded={layoutOpen}
+              >
+                Arrange <span className="chevron" aria-hidden="true">{layoutOpen ? "▴" : "▾"}</span>
+              </button>
+              {layoutOpen && (
+                <LayoutMenu
+                  units={units}
+                  sensors={sensors}
+                  onReorder={reorderUnits}
+                  onLink={linkControllers}
+                  onDisconnect={(controller) => void detachController(controller)}
+                  onUnlink={unlinkUnit}
+                />
+              )}
+            </div>
+          )}
           <button className="primary" onClick={handleConnect} disabled={!webhidSupported}>
             {controllers.length ? "Pair another Joy-Con" : "Connect Joy-Con"}
           </button>
@@ -223,26 +448,35 @@ export default function App() {
         </div>
 
         <aside className="sidebar">
-          {controllers.map((c) => (
-            <ControllerPanel
-              key={c.id}
-              controller={c}
-              playerLights={c.playerLights}
-              homeIntensity={c.homeIntensity}
-              onPlayerLights={(mask) =>
-                updateControllers((prev) =>
-                  prev.map((item) => (item.id === c.id ? { ...item, playerLights: mask } : item)),
-                )
-              }
-              onHomeIntensity={(v) =>
-                updateControllers((prev) =>
-                  prev.map((item) =>
-                    item.id === c.id ? { ...item, homeIntensity: v } : item,
-                  ),
-                )
-              }
-              onDisconnect={() => detachController(c)}
-            />
+          {units.map((unit) => (
+            <div
+              key={unit.id}
+              className={`controller-group${unit.kind === "pair" ? " pair" : ""}`}
+            >
+              {unit.controllers.map((c) => (
+                <ControllerPanel
+                  key={c.id}
+                  controller={c}
+                  playerLights={c.playerLights}
+                  homeIntensity={c.homeIntensity}
+                  onPlayerLights={(mask) =>
+                    updateControllers((prev) =>
+                      prev.map((item) =>
+                        item.id === c.id ? { ...item, playerLights: mask } : item,
+                      ),
+                    )
+                  }
+                  onHomeIntensity={(v) =>
+                    updateControllers((prev) =>
+                      prev.map((item) =>
+                        item.id === c.id ? { ...item, homeIntensity: v } : item,
+                      ),
+                    )
+                  }
+                  onDisconnect={() => void detachController(c)}
+                />
+              ))}
+            </div>
           ))}
         </aside>
       </div>
@@ -259,6 +493,304 @@ interface PanelProps {
   onDisconnect: () => void;
 }
 
+interface LayoutMenuProps {
+  units: ControllerUnit[];
+  sensors: ReturnType<typeof useSensors>;
+  onReorder: (activeId: number, overId: number) => void;
+  onLink: (activeControllerId: number, targetControllerId: number) => void;
+  onDisconnect: (controller: ConnectedController) => void;
+  onUnlink: (unit: ControllerUnit) => void;
+}
+
+function LayoutMenu({ units, sensors, onReorder, onLink, onDisconnect, onUnlink }: LayoutMenuProps) {
+  const [activeId, setActiveId] = useState<number | null>(null);
+  const [mergeTargetId, setMergeTargetId] = useState<number | null>(null);
+  const activeUnit = activeId === null ? null : units.find((unit) => unit.id === activeId) ?? null;
+  const connected = units.reduce((sum, unit) => sum + unit.controllers.length, 0);
+
+  const canMergeInto = (unit: ControllerUnit) => {
+    if (!activeUnit || activeUnit.kind !== "single") return false;
+    if (unit.kind !== "single" || unit.id === activeUnit.id) return false;
+    return isLinkablePair(
+      activeUnit.controllers[0]!.joycon.side,
+      unit.controllers[0]!.joycon.side,
+    );
+  };
+
+  // A chip's horizontal middle is a merge target; its left/right edges remain
+  // normal sortable areas. The merge zone wins only when the pointer is in it.
+  const collisionDetection: CollisionDetection = (args) => {
+    if (activeUnit?.kind === "single") {
+      const mergeZones = args.droppableContainers.filter((container) => {
+        const id = String(container.id);
+        if (!id.startsWith("merge:")) return false;
+        const unit = units.find((candidate) => candidate.id === Number(id.slice(6)));
+        return !!unit && canMergeInto(unit);
+      });
+      if (mergeZones.length) {
+        const hits = pointerWithin({ ...args, droppableContainers: mergeZones });
+        if (hits.length) return hits;
+      }
+    }
+    const chips = args.droppableContainers.filter(
+      (container) => !String(container.id).startsWith("merge:"),
+    );
+    return closestCenter({ ...args, droppableContainers: chips });
+  };
+
+  const handleDragOver = (event: DragOverEvent) => {
+    const overId = event.over?.id;
+    setMergeTargetId(
+      typeof overId === "string" && overId.startsWith("merge:")
+        ? Number(overId.slice(6))
+        : null,
+    );
+  };
+
+  const handleDragEnd = (event: DragEndEvent) => {
+    setActiveId(null);
+    setMergeTargetId(null);
+    const { active, over } = event;
+    if (!over) return;
+
+    const activeUnit = units.find((unit) => unit.id === active.id);
+    if (!activeUnit) return;
+
+    const overId = over.id;
+    if (typeof overId === "string" && overId.startsWith("merge:")) {
+      const targetUnit = units.find((unit) => unit.id === Number(overId.slice(6)));
+      if (targetUnit && activeUnit.kind === "single" && targetUnit.kind === "single") {
+        const activeController = activeUnit.controllers[0]!;
+        const targetController = targetUnit.controllers[0]!;
+        if (isLinkablePair(activeController.joycon.side, targetController.joycon.side)) {
+          onLink(activeController.id, targetController.id);
+        }
+      }
+      return;
+    }
+
+    if (active.id === overId) return;
+    const overUnit = units.find((unit) => unit.id === overId);
+    if (!overUnit) return;
+    onReorder(activeUnit.id, overUnit.id);
+  };
+
+  return (
+    <div className="layout-popover" role="dialog" aria-label="Controller arrangement">
+      <div className="layout-popover-head">
+        <div>
+          <strong>Controller order</strong>
+          <p>
+            {activeUnit
+              ? "Drop on the middle to merge; near the edges to reorder."
+              : "Drag to reorder. Drop on a chip's middle to merge L + R."}
+          </p>
+        </div>
+        <span className="layout-count">{connected} connected</span>
+      </div>
+
+      <DndContext
+        sensors={sensors}
+        collisionDetection={collisionDetection}
+        modifiers={[restrictToHorizontalAxis]}
+        onDragStart={(event) => {
+          setActiveId(Number(event.active.id));
+          setMergeTargetId(null);
+        }}
+        onDragOver={handleDragOver}
+        onDragEnd={handleDragEnd}
+        onDragCancel={() => {
+          setActiveId(null);
+          setMergeTargetId(null);
+        }}
+      >
+        <SortableContext
+          items={units.map((unit) => unit.id)}
+          strategy={horizontalListSortingStrategy}
+        >
+          <div className="layout-row">
+            {units.map((unit) => (
+              <SortableLayoutChip
+                key={unit.id}
+                unit={unit}
+                mergeTarget={mergeTargetId === unit.id}
+                hideGhost={activeId === unit.id && mergeTargetId !== null}
+                onDisconnect={onDisconnect}
+                onUnlink={onUnlink}
+              />
+            ))}
+          </div>
+        </SortableContext>
+        {createPortal(
+          <DragOverlay dropAnimation={{ duration: 180, easing: "cubic-bezier(0.2, 0, 0, 1)" }}>
+            {activeUnit ? (
+              <div
+                className={`layout-chip-overlay${mergeTargetId !== null ? " hidden" : ""}`}
+                inert
+                aria-hidden="true"
+              >
+                <LayoutChipBody
+                  unit={activeUnit}
+                  overlay
+                  onDisconnect={() => {}}
+                  onUnlink={() => {}}
+                />
+              </div>
+            ) : null}
+          </DragOverlay>,
+          document.body,
+        )}
+      </DndContext>
+
+      <p className="layout-hint">
+        Middle merges L + R · edges reorder · × disconnects · Unlink splits a pair.
+      </p>
+    </div>
+  );
+}
+
+function SortableLayoutChip({
+  unit,
+  mergeTarget,
+  hideGhost,
+  onDisconnect,
+  onUnlink,
+}: {
+  unit: ControllerUnit;
+  mergeTarget: boolean;
+  hideGhost: boolean;
+  onDisconnect: (controller: ConnectedController) => void;
+  onUnlink: (unit: ControllerUnit) => void;
+}) {
+  const {
+    attributes,
+    listeners,
+    setNodeRef,
+    setActivatorNodeRef,
+    transform,
+    transition,
+    isDragging,
+  } = useSortable({ id: unit.id });
+
+  return (
+    <div
+      ref={setNodeRef}
+      className={`layout-chip-item${isDragging ? " dragging" : ""}${hideGhost ? " hide-ghost" : ""}`}
+      style={{
+        transform: CSS.Translate.toString(transform),
+        transition,
+        zIndex: isDragging ? 2 : undefined,
+      }}
+    >
+      <LayoutChipBody
+        unit={unit}
+        mergeTarget={mergeTarget}
+        dragRef={setActivatorNodeRef}
+        dragAttributes={attributes}
+        dragListeners={listeners}
+        onDisconnect={onDisconnect}
+        onUnlink={onUnlink}
+      />
+    </div>
+  );
+}
+
+interface LayoutChipBodyProps {
+  unit: ControllerUnit;
+  overlay?: boolean;
+  mergeTarget?: boolean;
+  dragRef?: (node: HTMLElement | null) => void;
+  dragAttributes?: DraggableAttributes;
+  dragListeners?: DraggableSyntheticListeners;
+  onDisconnect: (controller: ConnectedController) => void;
+  onUnlink: (unit: ControllerUnit) => void;
+}
+
+function LayoutChipBody({
+  unit,
+  overlay = false,
+  mergeTarget = false,
+  dragRef,
+  dragAttributes,
+  dragListeners,
+  onDisconnect,
+  onUnlink,
+}: LayoutChipBodyProps) {
+  return (
+    <div className={`layout-chip${overlay ? " overlay" : ""}${mergeTarget ? " merge-target" : ""}`}>
+      <div
+        ref={dragRef}
+        className={`layout-chip-drag${overlay ? " static" : ""}`}
+        {...(dragAttributes ?? {})}
+        {...(dragListeners ?? {})}
+        aria-label={overlay ? undefined : `Reorder ${unitLabel(unit)} controller`}
+      >
+        <span className="chip-grip" aria-hidden="true">⠿</span>
+        <div className={`chip-pads${unit.kind === "pair" ? " linked" : ""}`}>
+          {unit.controllers.map((controller) => (
+            <span
+              key={controller.id}
+              className={`chip-pad side-${controller.joycon.side}`}
+              aria-hidden="true"
+            />
+          ))}
+        </div>
+        <span className="chip-label">{unitLabel(unit)}</span>
+      </div>
+
+      <div className="layout-chip-actions">
+        {unit.kind === "pair" && (
+          <button
+            type="button"
+            className="chip-action"
+            title="Unlink"
+            aria-label="Unlink controllers"
+            onPointerDown={(event) => event.stopPropagation()}
+            onClick={() => onUnlink(unit)}
+          >
+            Unlink
+          </button>
+        )}
+        {unit.controllers.map((controller) => (
+          <button
+            key={controller.id}
+            type="button"
+            className="chip-action"
+            title={`Disconnect ${sideTitle(controller.joycon.side)}`}
+            aria-label={`Disconnect ${sideTitle(controller.joycon.side)}`}
+            onPointerDown={(event) => event.stopPropagation()}
+            onClick={() => onDisconnect(controller)}
+          >
+            {unit.kind === "pair" ? `${sideShort(controller.joycon.side)}×` : "×"}
+          </button>
+        ))}
+      </div>
+
+      {!overlay && unit.kind === "single" && (
+        <MergeZone unitId={unit.id} active={mergeTarget} />
+      )}
+    </div>
+  );
+}
+
+function MergeZone({ unitId, active }: { unitId: number; active: boolean }) {
+  const { setNodeRef } = useDroppable({ id: `merge:${unitId}` });
+
+  return (
+    <div
+      ref={setNodeRef}
+      className={`merge-zone${active ? " visible" : ""}`}
+      aria-hidden="true"
+    >
+      {active && (
+        <span className="merge-label">
+          <span aria-hidden="true">⛓</span> Release to merge
+        </span>
+      )}
+    </div>
+  );
+}
+
 function ControllerPanel({
   controller,
   playerLights,
@@ -269,6 +801,7 @@ function ControllerPanel({
 }: PanelProps) {
   const { joycon, state } = controller;
   const sideLabel = sideTitle(joycon.side);
+  const linked = controller.partnerId !== null;
 
   const setMask = async (mask: number) => {
     onPlayerLights(mask);
@@ -297,6 +830,7 @@ function ControllerPanel({
           <div className="meta">
             <span>VID {joycon.device.vendorId.toString(16).padStart(4, "0")}</span>
             <span>PID {joycon.device.productId.toString(16).padStart(4, "0")}</span>
+            {linked && <span className="badge link-badge">Linked</span>}
           </div>
         </div>
         <button className="ghost" onClick={onDisconnect}>Disconnect</button>
