@@ -4,20 +4,37 @@ import { SceneController } from "./scene";
 import { imuToEuler } from "./orientation";
 
 interface ConnectedController {
+  id: number;
   joycon: JoyCon;
   state: JoyConState;
+  playerLights: number;
+  homeIntensity: number;
+  unsubscribe: () => void;
 }
 
 const BATTERY_LABEL = ["Empty", "Critical", "Low", "Medium", "Full"];
+
+function snapshotState(state: JoyConState): JoyConState {
+  return {
+    ...state,
+    buttons: { ...state.buttons },
+    leftStick: { ...state.leftStick, raw: { ...state.leftStick.raw } },
+    rightStick: { ...state.rightStick, raw: { ...state.rightStick.raw } },
+    imu: { ...state.imu, accel: { ...state.imu.accel }, gyro: { ...state.imu.gyro } },
+    orientation: { ...state.orientation },
+    battery: { ...state.battery },
+  };
+}
 
 export default function App() {
   const [controllers, setControllers] = useState<ConnectedController[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [webhidSupported, setWebhidSupported] = useState(true);
-  const [playerLights, setPlayerLights] = useState<number[]>([]);
-  const [homeIntensity, setHomeIntensity] = useState<number[]>([]);
   const sceneRef = useRef<SceneController | null>(null);
   const sceneContainerRef = useRef<HTMLDivElement | null>(null);
+  const controllersRef = useRef<ConnectedController[]>([]);
+  const attachedDevicesRef = useRef(new Set<HIDDevice>());
+  const nextControllerIdRef = useRef(1);
 
   // Mount scene
   useEffect(() => {
@@ -36,103 +53,135 @@ export default function App() {
     }
   }, []);
 
-  // Sync scene controller list with React state
+  // Rebuild the 3D scene only when the controller layout changes. Doing this
+  // on every state update would recreate the models at report rate.
+  const controllerSides = controllers.map((c) => c.joycon.side).join(",");
   useEffect(() => {
     const scene = sceneRef.current;
     if (!scene) return;
     scene.setControllers(controllers.map((c) => c.joycon.side));
-    controllers.forEach((c, i) => scene.updateState(i, c.state));
-  }, [controllers.length]);
+    controllers.forEach((c, i) => {
+      scene.updateState(i, c.state);
+      scene.setPlayerLights(i, c.playerLights);
+      scene.setHomeLight(i, c.homeIntensity);
+    });
+  }, [controllerSides]);
 
   useEffect(() => {
     const scene = sceneRef.current;
     if (!scene) return;
-    controllers.forEach((c, i) => scene.updateState(i, c.state));
+    controllers.forEach((c, i) => {
+      scene.updateState(i, c.state);
+      scene.setPlayerLights(i, c.playerLights);
+      scene.setHomeLight(i, c.homeIntensity);
+    });
   }, [controllers]);
 
-  const attachController = useCallback(async (jc: JoyCon) => {
-    try {
-      await jc.open();
-      const unsubscribe = jc.onState((s) => {
-        setControllers((prev) =>
-          prev.map((c) => (c.joycon === jc ? { ...c, state: { ...s, buttons: { ...s.buttons }, leftStick: { ...s.leftStick }, rightStick: { ...s.rightStick }, imu: { ...s.imu, accel: { ...s.imu.accel }, gyro: { ...s.imu.gyro } }, orientation: { ...s.orientation }, battery: { ...s.battery } } } : c)),
-        );
-      });
-      setControllers((prev) => [...prev, { joycon: jc, state: jc.state }]);
-      setPlayerLights((prev) => [...prev, 0b0001]);
-      setHomeIntensity((prev) => [...prev, 0]);
-      (jc as any)._unsub = unsubscribe;
-    } catch (e: any) {
-      setError(e?.message ?? String(e));
-    }
-  }, []);
-
-  const detachController = useCallback(async (jc: JoyCon) => {
-    try {
-      const unsub = (jc as any)._unsub as (() => void) | undefined;
-      unsub?.();
-      await jc.close();
-    } finally {
+  const updateControllers = useCallback(
+    (update: (prev: ConnectedController[]) => ConnectedController[]) => {
       setControllers((prev) => {
-        const idx = prev.findIndex((c) => c.joycon === jc);
-        if (idx < 0) return prev;
-        const next = [...prev];
-        next.splice(idx, 1);
+        const next = update(prev);
+        controllersRef.current = next;
         return next;
       });
-      setPlayerLights((prev) => prev.filter((_, i) => controllers[i]?.joycon !== jc));
-      setHomeIntensity((prev) => prev.filter((_, i) => controllers[i]?.joycon !== jc));
+    },
+    [],
+  );
+
+  const attachController = useCallback(async (jc: JoyCon, options: { silent?: boolean } = {}) => {
+    if (attachedDevicesRef.current.has(jc.device)) return;
+    attachedDevicesRef.current.add(jc.device);
+
+    try {
+      await jc.open();
+      const unsubscribe = jc.onState((state) => {
+        updateControllers((prev) =>
+          prev.map((c) => (c.joycon === jc ? { ...c, state: snapshotState(state) } : c)),
+        );
+      });
+      const id = nextControllerIdRef.current++;
+      updateControllers((prev) => [
+        ...prev,
+        {
+          id,
+          joycon: jc,
+          state: snapshotState(jc.state),
+          playerLights: 0b0001,
+          homeIntensity: 0,
+          unsubscribe,
+        },
+      ]);
+    } catch (e) {
+      attachedDevicesRef.current.delete(jc.device);
+      await jc.close().catch(() => {});
+      if (!options.silent) setError(e instanceof Error ? e.message : String(e));
     }
-  }, [controllers]);
+  }, [updateControllers]);
+
+  const detachController = useCallback(async (controller: ConnectedController) => {
+    controller.unsubscribe();
+    attachedDevicesRef.current.delete(controller.joycon.device);
+    updateControllers((prev) => prev.filter((c) => c.id !== controller.id));
+    try {
+      await controller.joycon.close();
+    } catch {}
+  }, [updateControllers]);
 
   const handleConnect = useCallback(async () => {
     setError(null);
     try {
       const found = await JoyCon.request();
       for (const jc of found) await attachController(jc);
-    } catch (e: any) {
-      setError(e?.message ?? String(e));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
     }
   }, [attachController]);
 
   // Auto-reconnect previously paired devices
   useEffect(() => {
+    let cancelled = false;
     (async () => {
       if (!("hid" in navigator)) return;
       const paired = await JoyCon.getPaired();
-      for (const jc of paired) await attachController(jc);
+      for (const jc of paired) {
+        if (cancelled) return;
+        await attachController(jc, { silent: true });
+      }
     })();
     const onConnect = (e: HIDConnectionEvent) => {
-      if (e.device.vendorId !== 0x057e) return;
+      if (!JoyCon.isSupported(e.device)) return;
       const jc = new JoyCon(e.device);
-      attachController(jc);
+      void attachController(jc);
     };
     const onDisconnect = (e: HIDConnectionEvent) => {
-      setControllers((prev) => prev.filter((c) => c.joycon.device !== e.device));
+      const target = controllersRef.current.find((c) => c.joycon.device === e.device);
+      if (target) {
+        target.unsubscribe();
+        void target.joycon.close();
+      }
+      attachedDevicesRef.current.delete(e.device);
+      updateControllers((prev) => prev.filter((c) => c.joycon.device !== e.device));
     };
     navigator.hid?.addEventListener("connect", onConnect);
     navigator.hid?.addEventListener("disconnect", onDisconnect);
     return () => {
+      cancelled = true;
       navigator.hid?.removeEventListener("connect", onConnect);
       navigator.hid?.removeEventListener("disconnect", onDisconnect);
     };
-  }, [attachController]);
+  }, [attachController, updateControllers]);
 
-  // Push player lights / home intensity to scene
+  // Close any open devices when the app unmounts.
   useEffect(() => {
-    const scene = sceneRef.current;
-    if (!scene) return;
-    // Just take the first controller's settings for the global scene representation per controller
-    // We update each per controller below in tick by setting the SceneController's lights for last set.
-    // Simpler: set values for the most recently-updated single mask (the scene currently shares a single mask).
-    // To support multi, set the union.
-    let union = 0;
-    for (const m of playerLights) union |= m;
-    scene.setPlayerLights(union);
-    let maxHome = 0;
-    for (const h of homeIntensity) maxHome = Math.max(maxHome, h);
-    scene.setHomeLight(maxHome);
-  }, [playerLights, homeIntensity]);
+    return () => {
+      for (const c of controllersRef.current) {
+        c.unsubscribe();
+        void c.joycon.close();
+      }
+      controllersRef.current = [];
+      attachedDevicesRef.current.clear();
+    };
+  }, []);
 
   return (
     <div className="app">
@@ -174,19 +223,25 @@ export default function App() {
         </div>
 
         <aside className="sidebar">
-          {controllers.map((c, idx) => (
+          {controllers.map((c) => (
             <ControllerPanel
-              key={c.joycon.device.productId + "-" + idx}
+              key={c.id}
               controller={c}
-              playerLights={playerLights[idx] ?? 0}
-              homeIntensity={homeIntensity[idx] ?? 0}
+              playerLights={c.playerLights}
+              homeIntensity={c.homeIntensity}
               onPlayerLights={(mask) =>
-                setPlayerLights((prev) => prev.map((m, i) => (i === idx ? mask : m)))
+                updateControllers((prev) =>
+                  prev.map((item) => (item.id === c.id ? { ...item, playerLights: mask } : item)),
+                )
               }
               onHomeIntensity={(v) =>
-                setHomeIntensity((prev) => prev.map((m, i) => (i === idx ? v : m)))
+                updateControllers((prev) =>
+                  prev.map((item) =>
+                    item.id === c.id ? { ...item, homeIntensity: v } : item,
+                  ),
+                )
               }
-              onDisconnect={() => detachController(c.joycon)}
+              onDisconnect={() => detachController(c)}
             />
           ))}
         </aside>
@@ -276,7 +331,7 @@ function ControllerPanel({
         </div>
       </div>
 
-      {joycon.side === "right" && (
+      {joycon.side !== "left" && (
         <div className="block">
           <h3>Home Light</h3>
           <input
@@ -455,7 +510,7 @@ function Imu({ state }: { state: JoyConState }) {
 
 function Quaternion({ state }: { state: JoyConState }) {
   const q = state.orientation;
-  // The stored quaternion is in IMU coordinates, not model coordinates.
+  // The stored quaternion uses the canonical (L/Pro) IMU frame, not model coordinates.
   const { roll, pitch, yaw } = imuToEuler(q);
   const deg = (r: number) => (r * 180) / Math.PI;
   return (

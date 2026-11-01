@@ -42,6 +42,15 @@ export interface StickState {
   raw: { x: number; y: number };
 }
 
+export interface StickCalibration {
+  cx: number;
+  cy: number;
+  xMin: number;
+  xMax: number;
+  yMin: number;
+  yMax: number;
+}
+
 export interface ImuFrame {
   accel: { x: number; y: number; z: number }; // g
   gyro: { x: number; y: number; z: number }; // deg/s
@@ -64,9 +73,9 @@ export interface JoyConState {
   buttons: ButtonState;
   leftStick: StickState;
   rightStick: StickState;
-  imu: ImuFrame; // most recent of the 3 frames
+  imu: ImuFrame; // most recent frame, normalised to the L/Pro IMU axes
   battery: BatteryState;
-  orientation: Quaternion;
+  orientation: Quaternion; // canonical IMU frame (see imuToModelQuaternion)
   packetCounter: number;
 }
 
@@ -86,13 +95,20 @@ const emptyImu = (): ImuFrame => ({
 
 export type StateListener = (state: JoyConState) => void;
 
+interface PendingSubcommand {
+  subcommand: number;
+  resolve: (data: DataView) => void;
+  reject: (reason: unknown) => void;
+}
+
 export class JoyCon {
   device: HIDDevice;
   side: JoyConSide;
   state: JoyConState;
   private packetNumber = 0;
   private listeners = new Set<StateListener>();
-  private subcommandResolvers = new Map<number, (data: DataView) => void>();
+  private pendingSubcommand: PendingSubcommand | null = null;
+  private subcommandQueue: Promise<unknown> = Promise.resolve();
   private gyroBias = { x: 0, y: 0, z: 0 };
   private lastImuTime = 0;
   private calibrated = false;
@@ -100,12 +116,12 @@ export class JoyCon {
   private calibSum = { x: 0, y: 0, z: 0 };
 
   // Stick calibration (defaults; replaced after reading SPI)
-  private leftStickCal = {
+  private leftStickCal: StickCalibration = {
     cx: 2048, cy: 2048,
     xMin: 700, xMax: 700,
     yMin: 700, yMax: 700,
   };
-  private rightStickCal = {
+  private rightStickCal: StickCalibration = {
     cx: 2048, cy: 2048,
     xMin: 700, xMax: 700,
     yMin: 700, yMax: 700,
@@ -132,6 +148,15 @@ export class JoyCon {
     return "pro";
   }
 
+  static isSupported(device: HIDDevice): boolean {
+    return (
+      device.vendorId === NINTENDO_VENDOR_ID &&
+      (device.productId === JOYCON_L_PID ||
+        device.productId === JOYCON_R_PID ||
+        device.productId === PRO_CONTROLLER_PID)
+    );
+  }
+
   static async request(): Promise<JoyCon[]> {
     const devices = await navigator.hid.requestDevice({
       filters: [
@@ -145,14 +170,14 @@ export class JoyCon {
 
   static async getPaired(): Promise<JoyCon[]> {
     const devices = await navigator.hid.getDevices();
-    return devices
-      .filter((d) => d.vendorId === NINTENDO_VENDOR_ID)
-      .map((d) => new JoyCon(d));
+    return devices.filter(JoyCon.isSupported).map((d) => new JoyCon(d));
   }
 
   onState(listener: StateListener) {
     this.listeners.add(listener);
-    return () => this.listeners.delete(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
   }
 
   private emit() {
@@ -170,10 +195,13 @@ export class JoyCon {
     await this.readStickCalibration();
     await this.setReportMode(0x30);
     await this.setPlayerLights(0b0001);
+    if (this.side !== "left") await this.setHomeLight(0);
   }
 
   async close() {
     try {
+      this.pendingSubcommand?.resolve(new DataView(new ArrayBuffer(0)));
+      this.pendingSubcommand = null;
       this.device.removeEventListener("inputreport", this.handleInputReport);
       if (this.device.opened) await this.device.close();
     } catch {}
@@ -221,32 +249,55 @@ export class JoyCon {
   }
 
   async sendSubcommand(subcmd: number, args: Uint8Array = new Uint8Array()): Promise<DataView | null> {
-    // Output report 0x01 body: packet#(1) + rumble(8) + subcmdId(1) + args(N) = 10 + N bytes.
-    const payload = new Uint8Array(10 + args.length);
-    payload[0] = this.nextPacketNumber();
-    payload.set(this.buildRumbleNeutral(), 1);
-    payload[9] = subcmd;
-    if (args.length) payload.set(args, 10);
-    // Wait for reply (report 0x21) carrying this subcommand
-    const pending = new Promise<DataView>((resolve) => {
-      const t = window.setTimeout(() => {
-        if (this.subcommandResolvers.get(subcmd) === resolve as any) {
-          this.subcommandResolvers.delete(subcmd);
-        }
-        resolve(new DataView(new ArrayBuffer(0)));
-      }, 250);
-      this.subcommandResolvers.set(subcmd, (data) => {
-        window.clearTimeout(t);
-        resolve(data);
+    const run = async (): Promise<DataView> => {
+      // Output report 0x01 body: packet#(1) + rumble(8) + subcmdId(1) + args(N) = 10 + N bytes.
+      const payload = new Uint8Array(10 + args.length);
+      payload[0] = this.nextPacketNumber();
+      payload.set(this.buildRumbleNeutral(), 1);
+      payload[9] = subcmd;
+      if (args.length) payload.set(args, 10);
+
+      // A 0x21 reply identifies the subcommand but not the request packet, so
+      // keep a single request in flight. This prevents a late reply from an
+      // earlier request being matched to a newer one with the same subcommand.
+      let timeout = 0;
+      const entry: PendingSubcommand = {
+        subcommand: subcmd,
+        resolve: () => {},
+        reject: () => {},
+      };
+      const reply = new Promise<DataView>((resolve, reject) => {
+        entry.resolve = (data) => {
+          window.clearTimeout(timeout);
+          if (this.pendingSubcommand === entry) this.pendingSubcommand = null;
+          resolve(data);
+        };
+        entry.reject = (reason) => {
+          window.clearTimeout(timeout);
+          if (this.pendingSubcommand === entry) this.pendingSubcommand = null;
+          reject(reason);
+        };
+        timeout = window.setTimeout(() => {
+          if (this.pendingSubcommand === entry) this.pendingSubcommand = null;
+          resolve(new DataView(new ArrayBuffer(0)));
+        }, 250);
+        this.pendingSubcommand = entry;
       });
-    });
-    try {
-      await this.sendOutput(0x01, payload);
-    } catch (e) {
-      this.subcommandResolvers.delete(subcmd);
-      throw e;
-    }
-    return pending;
+
+      try {
+        await this.sendOutput(0x01, payload);
+      } catch (e) {
+        entry.reject(e);
+      }
+      return reply;
+    };
+
+    const result = this.subcommandQueue.then(run, run);
+    this.subcommandQueue = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
   }
 
   async setReportMode(mode: number) {
@@ -270,13 +321,8 @@ export class JoyCon {
     await this.sendSubcommand(0x30, new Uint8Array([mask & 0xff]));
   }
 
-  async setHomeLight(intensity: number, durationCycles = 0xf) {
-    // intensity 0..15. mini pattern: 1 cycle, both base+mini intensities.
-    const i = Math.max(0, Math.min(15, Math.round(intensity)));
-    const byte1 = (1 << 4) | (durationCycles & 0x0f); // 1 mini cycle, total duration nibble
-    const byte2 = (i << 4) | 0x0; // start intensity (i) | LED off intensity (0)
-    const byte3 = (0xf << 4) | 0x0; // fade duration | duration of intensity
-    await this.sendSubcommand(0x38, new Uint8Array([byte1, byte2, byte3]));
+  async setHomeLight(intensity: number) {
+    await this.sendSubcommand(0x38, buildHomeLightPayload(intensity));
   }
 
   async rumble(lowFreq: number, lowAmp: number, highFreq: number, highAmp: number) {
@@ -318,26 +364,10 @@ export class JoyCon {
       // Factory left + right stick cal at 0x603D, 18 bytes (L 9, R 9)
       const data = await this.readSpi(0x603d, 18);
       if (!data) return;
-      const lXmax = data[0]! | ((data[1]! & 0x0f) << 8);
-      const lYmax = (data[1]! >> 4) | (data[2]! << 4);
-      const lCx = data[3]! | ((data[4]! & 0x0f) << 8);
-      const lCy = (data[4]! >> 4) | (data[5]! << 4);
-      const lXmin = data[6]! | ((data[7]! & 0x0f) << 8);
-      const lYmin = (data[7]! >> 4) | (data[8]! << 4);
-
-      const rCx = data[9]! | ((data[10]! & 0x0f) << 8);
-      const rCy = (data[10]! >> 4) | (data[11]! << 4);
-      const rXmin = data[12]! | ((data[13]! & 0x0f) << 8);
-      const rYmin = (data[13]! >> 4) | (data[14]! << 4);
-      const rXmax = data[15]! | ((data[16]! & 0x0f) << 8);
-      const rYmax = (data[16]! >> 4) | (data[17]! << 4);
-
-      if (lCx > 0) {
-        this.leftStickCal = { cx: lCx, cy: lCy, xMin: lXmin, xMax: lXmax, yMin: lYmin, yMax: lYmax };
-      }
-      if (rCx > 0) {
-        this.rightStickCal = { cx: rCx, cy: rCy, xMin: rXmin, xMax: rXmax, yMin: rYmin, yMax: rYmax };
-      }
+      const calibration = parseStickCalibration(data);
+      if (!calibration) return;
+      if (calibration.left.cx > 0) this.leftStickCal = calibration.left;
+      if (calibration.right.cx > 0) this.rightStickCal = calibration.right;
     } catch {
       // ignore, use defaults
     }
@@ -349,9 +379,13 @@ export class JoyCon {
     try {
       const data = event.data;
       const reportId = event.reportId;
-      if (reportId === 0x30 || reportId === 0x21) {
-        this.parseStandard(data);
-        if (reportId === 0x21) this.handleSubcommandReply(data);
+      if (reportId === 0x30) {
+        this.parseStandard(data, true);
+        this.emit();
+      } else if (reportId === 0x21) {
+        // 0x21 carries subcommand replies instead of the three IMU frames.
+        this.parseStandard(data, false);
+        this.handleSubcommandReply(data);
         this.emit();
       } else if (reportId === 0x3f) {
         // simple HID mode (not used after init)
@@ -362,37 +396,26 @@ export class JoyCon {
   };
 
   private handleSubcommandReply(data: DataView) {
-    // 0x21 body layout (no report ID): 0..11 standard, 12 = ACK, 13 = subcmd id, 14+ = reply data.
-    if (data.byteLength < 14) return;
-    const subcmd = data.getUint8(13);
-    const resolver = this.subcommandResolvers.get(subcmd);
-    if (!resolver) return;
-    this.subcommandResolvers.delete(subcmd);
-    // Reply DataView starts at the actual reply data (byte 14).
-    const start = data.byteOffset + 14;
-    const len = data.byteLength - 14;
-    if (len <= 0 || start + len > data.buffer.byteLength) {
-      resolver(new DataView(new ArrayBuffer(0)));
-      return;
-    }
-    resolver(new DataView(data.buffer, start, len));
+    const reply = parseSubcommandReply(data);
+    if (!reply) return;
+    const pending = this.pendingSubcommand;
+    if (!pending || pending.subcommand !== reply.subcommand) return;
+    this.pendingSubcommand = null;
+    pending.resolve(reply.data);
   }
 
-  private parseStandard(data: DataView) {
+  private parseStandard(data: DataView, includeImu: boolean) {
     // data is the report body (without reportId byte for WebHID)
     // byte 0 = timer, byte 1 = battery/conn, bytes 2-4 = buttons, 5-7 left stick, 8-10 right stick,
     // byte 11 vibrator input, 12..47 imu (3 frames of 12).
     if (data.byteLength < 12) return;
 
-    const battByte = data.getUint8(1);
+    // Upper nibble: 8=full, 6=medium, 4=low, 2=critical, 0=empty; LSB = charging.
+    const upper = (data.getUint8(1) >> 4) & 0x0f;
     this.state.battery = {
-      level: (battByte >> 5) & 0x07,
-      charging: ((battByte >> 4) & 0x01) === 1,
+      level: Math.min(4, Math.floor(upper / 2)),
+      charging: (upper & 0x01) === 1,
     };
-    // The official mapping uses upper nibble: bit7..4. Battery levels 8=full,6,4,2,0 with +1 = charging
-    const upper = (battByte >> 4) & 0x0f;
-    this.state.battery.charging = (upper & 0x01) === 1;
-    this.state.battery.level = Math.min(4, Math.floor(upper / 2));
 
     const b0 = data.getUint8(2); // right side buttons
     const b1 = data.getUint8(3); // shared
@@ -429,7 +452,7 @@ export class JoyCon {
     const ls2 = data.getUint8(7);
     const lx = ls0 | ((ls1 & 0x0f) << 8);
     const ly = (ls1 >> 4) | (ls2 << 4);
-    this.state.leftStick = this.normalizeStick(lx, ly, this.leftStickCal);
+    this.state.leftStick = normalizeStick(lx, ly, this.leftStickCal);
 
     // Right stick (bytes 8-10)
     const rs0 = data.getUint8(8);
@@ -437,10 +460,10 @@ export class JoyCon {
     const rs2 = data.getUint8(10);
     const rx = rs0 | ((rs1 & 0x0f) << 8);
     const ry = (rs1 >> 4) | (rs2 << 4);
-    this.state.rightStick = this.normalizeStick(rx, ry, this.rightStickCal);
+    this.state.rightStick = normalizeStick(rx, ry, this.rightStickCal);
 
-    // IMU
-    if (data.byteLength >= 12 + 36) {
+    // IMU (only present in full 0x30 reports).
+    if (includeImu && data.byteLength >= 12 + 36) {
       const frames: ImuFrame[] = [];
       for (let f = 0; f < 3; f++) {
         const off = 12 + f * 12;
@@ -450,32 +473,21 @@ export class JoyCon {
         const gx = data.getInt16(off + 6, true);
         const gy = data.getInt16(off + 8, true);
         const gz = data.getInt16(off + 10, true);
-        frames.push({
-          accel: { x: ax / 4096, y: ay / 4096, z: az / 4096 },
-          gyro: { x: gx * 0.06103, y: gy * 0.06103, z: gz * 0.06103 },
-        });
+        frames.push(
+          normalizeImuFrame(
+            {
+              accel: { x: ax / 4096, y: ay / 4096, z: az / 4096 },
+              gyro: { x: gx * 0.06103, y: gy * 0.06103, z: gz * 0.06103 },
+            },
+            this.side,
+          ),
+        );
       }
       this.state.imu = frames[2]!;
       this.integrateOrientation(frames);
     }
 
     this.state.packetCounter++;
-  }
-
-  private normalizeStick(rx: number, ry: number, cal: typeof this.leftStickCal): StickState {
-    const dx = rx - cal.cx;
-    const dy = ry - cal.cy;
-    const nx = dx >= 0 ? dx / Math.max(1, cal.xMax) : dx / Math.max(1, cal.xMin);
-    const ny = dy >= 0 ? dy / Math.max(1, cal.yMax) : dy / Math.max(1, cal.yMin);
-    // small deadzone
-    const dz = 0.1;
-    const ax = Math.abs(nx) < dz ? 0 : nx;
-    const ay = Math.abs(ny) < dz ? 0 : ny;
-    return {
-      x: Math.max(-1, Math.min(1, ax)),
-      y: Math.max(-1, Math.min(1, ay)),
-      raw: { x: rx, y: ry },
-    };
   }
 
   // ---- Orientation integration (gyroscope) ----
@@ -490,7 +502,9 @@ export class JoyCon {
 
   private integrateOrientation(frames: ImuFrame[]) {
     const now = performance.now();
-    const dtTotal = this.lastImuTime ? (now - this.lastImuTime) / 1000 : 0.015;
+    // Clamp the gap: if reports were paused (background tab, Bluetooth stall),
+    // a multi-second dt would fling the integrated orientation.
+    const dtTotal = this.lastImuTime ? Math.min((now - this.lastImuTime) / 1000, 0.1) : 0.015;
     this.lastImuTime = now;
     const dtFrame = dtTotal / frames.length;
 
@@ -567,6 +581,91 @@ export class JoyCon {
 
     this.state.orientation = q;
   }
+}
+
+/**
+ * The right Joy-Con's IMU is mounted mirrored: raw Y and Z point opposite to
+ * the left Joy-Con / Pro Controller. Flip them so sensor fusion and the 3D
+ * model can use one shared axis convention.
+ */
+export function normalizeImuFrame(frame: ImuFrame, side: JoyConSide): ImuFrame {
+  if (side !== "right") return frame;
+  return {
+    accel: { x: frame.accel.x, y: -frame.accel.y, z: -frame.accel.z },
+    gyro: { x: frame.gyro.x, y: -frame.gyro.y, z: -frame.gyro.z },
+  };
+}
+
+/** Parse the 18-byte factory calibration block from SPI address 0x603D. */
+export function parseStickCalibration(data: Uint8Array): {
+  left: StickCalibration;
+  right: StickCalibration;
+} | null {
+  if (data.length < 18) return null;
+
+  const lXmax = data[0]! | ((data[1]! & 0x0f) << 8);
+  const lYmax = (data[1]! >> 4) | (data[2]! << 4);
+  const lCx = data[3]! | ((data[4]! & 0x0f) << 8);
+  const lCy = (data[4]! >> 4) | (data[5]! << 4);
+  const lXmin = data[6]! | ((data[7]! & 0x0f) << 8);
+  const lYmin = (data[7]! >> 4) | (data[8]! << 4);
+
+  const rCx = data[9]! | ((data[10]! & 0x0f) << 8);
+  const rCy = (data[10]! >> 4) | (data[11]! << 4);
+  const rXmin = data[12]! | ((data[13]! & 0x0f) << 8);
+  const rYmin = (data[13]! >> 4) | (data[14]! << 4);
+  const rXmax = data[15]! | ((data[16]! & 0x0f) << 8);
+  const rYmax = (data[16]! >> 4) | (data[17]! << 4);
+
+  return {
+    left: { cx: lCx, cy: lCy, xMin: lXmin, xMax: lXmax, yMin: lYmin, yMax: lYmax },
+    right: { cx: rCx, cy: rCy, xMin: rXmin, xMax: rXmax, yMin: rYmin, yMax: rYmax },
+  };
+}
+
+/** Normalise a 12-bit stick reading to -1..1, applying the deadzone. */
+export function normalizeStick(rx: number, ry: number, cal: StickCalibration): StickState {
+  const dx = rx - cal.cx;
+  const dy = ry - cal.cy;
+  const nx = dx >= 0 ? dx / Math.max(1, cal.xMax) : dx / Math.max(1, cal.xMin);
+  const ny = dy >= 0 ? dy / Math.max(1, cal.yMax) : dy / Math.max(1, cal.yMin);
+  const dz = 0.1;
+  const ax = Math.abs(nx) < dz ? 0 : nx;
+  const ay = Math.abs(ny) < dz ? 0 : ny;
+  return {
+    x: Math.max(-1, Math.min(1, ax)),
+    y: Math.max(-1, Math.min(1, ay)),
+    raw: { x: rx, y: ry },
+  };
+}
+
+/**
+ * Parse a 0x21 report body (report ID already stripped by WebHID).
+ * 0 = timer, 1 = battery, 2..4 = buttons, 5..10 = sticks,
+ * 11 = vibrator, 12 = ACK, 13 = subcommand, 14.. = reply data.
+ */
+export function parseSubcommandReply(
+  data: DataView,
+): { subcommand: number; data: DataView } | null {
+  if (data.byteLength < 14) return null;
+  const start = data.byteOffset + 14;
+  const length = data.byteLength - 14;
+  return {
+    subcommand: data.getUint8(13),
+    data: length > 0
+      ? new DataView(data.buffer, start, length)
+      : new DataView(new ArrayBuffer(0)),
+  };
+}
+
+/**
+ * Build subcommand 0x38 for a steady HOME LED at 0..15 intensity.
+ * One mini-cycle at the requested intensity and no full cycles keeps the LED
+ * steady; sending a 100% mini-cycle here would make 0% flash at full power.
+ */
+export function buildHomeLightPayload(intensity: number): Uint8Array {
+  const i = Math.max(0, Math.min(15, Math.round(intensity)));
+  return new Uint8Array([0x01, i << 4, i << 4, 0x00]);
 }
 
 // --- HD Rumble encoding (very approximate). Encodes a single low+high tone.

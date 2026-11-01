@@ -11,8 +11,8 @@ export class SceneController {
   container: HTMLElement;
   meshes: ControllerModel[] = [];
   states: (JoyConState | null)[] = [];
-  homeLightIntensity = 0;
-  playerLights = 0;
+  homeLights: number[] = [];
+  playerLights: number[] = [];
   private resizeObserver: ResizeObserver;
   private environment: THREE.WebGLRenderTarget;
   private key: THREE.DirectionalLight;
@@ -134,6 +134,8 @@ export class SceneController {
     Object.assign(this.key.shadow.camera, { left: -shadowExtent, right: shadowExtent, top: shadowExtent, bottom: -shadowExtent });
     this.key.shadow.camera.updateProjectionMatrix();
     this.states = new Array(this.meshes.length).fill(null);
+    this.playerLights = new Array(this.meshes.length).fill(0);
+    this.homeLights = new Array(this.meshes.length).fill(0);
     this.resize();
   }
 
@@ -141,12 +143,12 @@ export class SceneController {
     this.states[idx] = state;
   }
 
-  setHomeLight(intensity: number) {
-    this.homeLightIntensity = intensity;
+  setHomeLight(idx: number, intensity: number) {
+    this.homeLights[idx] = intensity;
   }
 
-  setPlayerLights(mask: number) {
-    this.playerLights = mask;
+  setPlayerLights(idx: number, mask: number) {
+    this.playerLights[idx] = mask;
   }
 
   start() {
@@ -175,15 +177,16 @@ export class SceneController {
     const smoothing = 1 - Math.exp(-24 * dt);
     this.meshes.forEach((model, i) => {
       const state = this.states[i];
+      const mask = this.playerLights[i] ?? 0;
       model.playerLights.forEach((led, j) => {
-        const on = !!state && !!((this.playerLights >> j) & 1);
+        const on = !!state && !!((mask >> j) & 1);
         led.material.color.setHex(on ? 0xb8ef83 : 0x525a50);
         led.material.emissive.setHex(on ? 0x8fda52 : 0x000000);
         led.material.emissiveIntensity = on ? 1.2 : 0;
       });
       if (model.homeRing) {
         model.homeRing.material.emissive.setHex(0x7fcfff);
-        model.homeRing.material.emissiveIntensity = state ? this.homeLightIntensity * 2 : 0;
+        model.homeRing.material.emissiveIntensity = state ? (this.homeLights[i] ?? 0) * 2 : 0;
       }
       if (!state) {
         model.outerGroup.rotation.set(-0.10, (i % 2 ? -1 : 1) * 0.20 + Math.sin(time * 0.45) * 0.08, (i % 2 ? -1 : 1) * 0.06);
